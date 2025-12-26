@@ -3,6 +3,8 @@
 import struct
 import string
 import json
+import glob
+from pathlib import Path
 
 ALLOWED_FILENAME_LETTERS = string.ascii_letters + string.digits + '.'
 TEST_FILE = "data/music/credits.mus"
@@ -75,6 +77,8 @@ def get_sample_data(vfile):
     while True:
         # get a section of data
         sample_struct = VF_sample_info.read(SAMPLE_STRUCT_SIZE)
+        if sample_struct == b'':
+            break
         cur_section += 1
         sample_name, sample_type, sample_size, sample_iden, sample_loop_start, sample_loop_end, extra_data = SAMPLE_STRUCT.unpack(sample_struct)
         # if the value at 1c is == 0, then we've reached the end of the info
@@ -89,8 +93,8 @@ def get_sample_data(vfile):
         sample_name = remove_trailing_zeros_from_str(sample_name.decode('utf8'))
         s = Sample(sample_name, sample_type, sample_size, sample_iden, sample_loop_start, sample_loop_end, extra_data, cur_section)
         samples[cur_section-1] = s
-        print(s)
-    print(samples)
+        # print(s)
+    # print(samples)
     return samples
 
 
@@ -109,51 +113,93 @@ def get_seq_data(vfile):
                 sequences.append(0)
         else:
             sequences.append(next_byte)
-    return sequences
+    num_channels = sequences[0]
+    sequences = sequences[1:]
+    return num_channels, sequences
 
-def get_note_info(vfile):
-    # read all of the data
-    notes_data = vfile.read(vfile.size - SEQ_INFO_BYTES - HEADER_BYTES)
-    len_str = 6
-    num_notes = len(notes_data)//len_str
 
-    unique = []
-    for i in range(num_notes):
-        cur_notes = notes_data[i*len_str:i*len_str+len_str]
-        # cur_notes[0] = sample num in reference t
-        # cur_notes[1] = always 0
-        # cur_notes[2.1] = 1111 relate to something each?
-        # cur_notes[2.2] = 0, f, or 8
-        # cur_notes[3] = 0xFF or 0x00?
-        # cur_notes[4] = note info?
-        # cur_notes[5] = ?
-        if cur_notes not in unique:
-            unique.append(cur_notes)
-    return unique
+def display_seq_info(seq_info):
+    header = "0000|1111|2222|3333|4444|5555|6666|7777|8888|9999|AAAA|BBBB|CCCC|DDDD|EEEE|FFFF"
+    contents = []
+    for x in seq_info:
+        # split into 4s to add the barrier between
+        split_thing = []
+        for i in range(len(x)//4):
+            split_thing.append(''.join([str(y) for y in x[i*4:(i+1)*4]]))
+        contents.append('|'.join(split_thing))
+    print(header)
+    for c in contents:
+        print(c)
+    print('')
 
-def main():
-    with open(TEST_FILE, "rb") as f:
+
+def get_note_info(vfile, num_channels):
+
+    data_size = vfile.size - SEQ_INFO_BYTES - HEADER_BYTES
+    notes_file = VirtualFile(vfile.read(data_size))
+
+    # 6 = length of the struct
+    # 64 = guessed length of the thingy
+    section_size = 6 * num_channels * 64
+    num_seqs = int(data_size / section_size)
+    notes_per_seq = section_size // 6
+
+    for i in range(num_seqs):
+        seq_info = [None] * num_channels
+        # split into 6 byte parts for each thing
+        for _ in range(64):
+            for channel in range(num_channels):
+                note = notes_file.read(6)
+                if seq_info[channel] == None:
+                    seq_info[channel] = [note[0]]
+                else:
+                    seq_info[channel].append(note[0])
+        display_seq_info(seq_info)
+
+
+def process_mus_file(filename):
+    with open(filename, "rb") as f:
         read_data = f.read()
-
     VF = VirtualFile(read_data)
     # Parse the sample header from 0x0 - 0x568
     samples = get_sample_data(VF)
-    num_samples = len(samples)
+    for s in samples:
+        if s:
+            print(s)
+    num_samples = len([s for s in samples if s is not None])
     # parse the seq header from 0x568 - 0x774
-    order = get_seq_data(VF)
-    num_seq = len(order)
-    num_sections = max(order) + 1
-    print(f'Num seq: {num_seq}; order: {order}, num_sections: {num_sections}')
+    num_channels, order = get_seq_data(VF)
     # Now we get into the track information... 0x774 til end
+    get_note_info(VF, num_channels)
     # calculate the end
     len_tracks = VF.size - 0x774
-    print(len_tracks)
-    # 6 is assumed note info struct length
-    num_notes = len_tracks / 6
-    print(f'{num_notes=}')
-    # there are EVENLY divided sections
-    size_of_section = num_notes / num_sections
-    print(f'{size_of_section=}')
+    section_size = 6 * num_channels * 64
+    return len_tracks, num_samples, order
+
+def main():
+    # read all files that end with .mus, get the size of the data and get some info on it...
+    # with open(TEST_FILE, "rb") as f:
+    #     read_data = f.read()
+    # 
+    # VF = VirtualFile(read_data)
+    # # Parse the sample header from 0x0 - 0x568
+    # samples = get_sample_data(VF)
+    # num_samples = len(samples)
+    # # parse the seq header from 0x568 - 0x774
+    # order = get_seq_data(VF)
+    # num_seq = len(order)
+    # num_sections = max(order) + 1
+    # print(f'Num seq: {num_seq}; order: {order}, num_sections: {num_sections}')
+    # # Now we get into the track information... 0x774 til end
+    # # calculate the end
+    # len_tracks = VF.size - 0x774
+    # print(len_tracks)
+    # # 6 is assumed note info struct length
+    # num_notes = len_tracks / 6
+    # print(f'{num_notes=}')
+    # # there are EVENLY divided sections
+    # size_of_section = num_notes / num_sections
+    # print(f'{size_of_section=}')
     # do some research on all of the bytes n stuff
     # ret = get_note_info(VF)
     # a = set()
@@ -163,4 +209,23 @@ def main():
     # print(a)
     # print([hex(a) for a in ret if a[0] == 5])
     # print(json.dumps(thing, indent=4))
+    data = {}
+    for mfile in glob.glob("data/music/pokerintro.mus"):
+        filename = Path(mfile).name
+        tracklen, nsample, seqs = process_mus_file(mfile)
+        num_channels = seqs[0]
+        # probably some stereo thing
+        section_size = 6 * num_channels * 64
+        # No idea wtf this shit is
+        #  "NumSequencesPlayed": seqs[1],
+        data.update({filename: {
+            "TrackLen": tracklen,
+            "NumSamples": nsample,
+            "NumChannels": seqs[0],
+            "NumSequencesPlayed": seqs[1],
+            # "Seqs": seqs[2:],
+            "CalcNumSeqs": tracklen/section_size
+        }})
+    print(json.dumps(data, indent=4))
+
 main()
