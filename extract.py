@@ -5,8 +5,11 @@ import string
 import json
 
 ALLOWED_FILENAME_LETTERS = string.ascii_letters + string.digits + '.'
-TEST_FILE = "data/music/decoder.mus"
+TEST_FILE = "data/music/credits.mus"
+TITLE_HEADER = 20  # bytes reserved for the header, if it exists
 HEADER_BYTES = 0x568
+# HEADER CONTENTS:
+## 2c x 31 channels (2x16?)
 SEQ_INFO_BYTES = 0x20C  # 0x774-0x568
 SAMPLE_STRUCT_SIZE = 0x2c
 SAMPLE_STRUCT_FORMAT = "<20sIIIIII"
@@ -17,12 +20,8 @@ def remove_trailing_zeros_from_str(s):
     return s.replace('\x00', '')
 
 
-def is_valid_sample_name(peaked):
-    return all([chr(b) in ALLOWED_FILENAME_LETTERS for b in peaked])
-
-
 class Sample:
-    def __init__(self, sname, stype, ssize, siden, sloops, sloope, edata, nsec):
+    def __init__(self, sname, stype, ssize, siden, sloops, sloope, edata, snume):
         self.sname = sname
         self.stype = stype
         self.ssize = ssize
@@ -30,7 +29,7 @@ class Sample:
         self.sloops = sloops
         self.sloope = sloope
         self.edata = edata
-        self.nsec = nsec
+        self.snume = snume
     
     def __str__(self):
         s = [f"Sample Name: {self.sname}",
@@ -39,13 +38,14 @@ class Sample:
              f"Iden: {self.siden}",
              f"Loop start: {self.sloops}",
              f"Loop end: {self.sloope}",
-             f'Num sections: {self.nsec}']
+             f'Section num: {self.snume}']
         return "\n\t".join(s)
 
 
 class VirtualFile:
     data = None
     pos = 0
+    size = -1
 
     def __init__(self, data):
         self.data = data
@@ -60,7 +60,8 @@ class VirtualFile:
 
 
 def get_sample_data(vfile):
-    samples = []
+    # Technically, there is a 31 max sample length here
+    samples = [None] * 31
     VF_sample_info = VirtualFile(vfile.read(HEADER_BYTES))
     # Skip title if exists
     while VF_sample_info.peak(1) != b'\x00':
@@ -70,33 +71,26 @@ def get_sample_data(vfile):
         VF_sample_info.read(1)
     # Read sample information
     next_session = False
-    num_samples = 0
+    cur_section = 0
     while True:
-        num_sections = 0
         # get a section of data
         sample_struct = VF_sample_info.read(SAMPLE_STRUCT_SIZE)
+        cur_section += 1
         sample_name, sample_type, sample_size, sample_iden, sample_loop_start, sample_loop_end, extra_data = SAMPLE_STRUCT.unpack(sample_struct)
         # if the value at 1c is == 0, then we've reached the end of the info
         if sample_iden == 0:
             break
+        if sample_name == b'\x00'*20:
+            # Extra data from current sample, keep reading...
+            VF_sample_info.read(SAMPLE_STRUCT_SIZE)
+            cur_section += 1
+            continue
         # First 24 bytes are the the sample name, which is loaded in from /music/%s
         sample_name = remove_trailing_zeros_from_str(sample_name.decode('utf8'))
-        # peak until the stringname contains .pcm
-        while True:
-            sample_struct = VF_sample_info.peak(SAMPLE_STRUCT_SIZE)
-            sname, _, __, siden, ___, _____, ______ = SAMPLE_STRUCT.unpack(sample_struct)
-            # We've hit the end of the section
-            if siden == 0:
-                break
-            if sname == b'\x00'*20:
-                # Extra data from current sample, keep reading...
-                VF_sample_info.read(SAMPLE_STRUCT_SIZE)
-                num_sections += 1
-            else:
-                break
-        s = Sample(sample_name, sample_type, sample_size, sample_iden, sample_loop_start, sample_loop_end, extra_data, num_sections)
-        samples.append(s)
+        s = Sample(sample_name, sample_type, sample_size, sample_iden, sample_loop_start, sample_loop_end, extra_data, cur_section)
+        samples[cur_section-1] = s
         print(s)
+    print(samples)
     return samples
 
 
@@ -116,7 +110,26 @@ def get_seq_data(vfile):
         else:
             sequences.append(next_byte)
     return sequences
-    
+
+def get_note_info(vfile):
+    # read all of the data
+    notes_data = vfile.read(vfile.size - SEQ_INFO_BYTES - HEADER_BYTES)
+    len_str = 6
+    num_notes = len(notes_data)//len_str
+
+    unique = []
+    for i in range(num_notes):
+        cur_notes = notes_data[i*len_str:i*len_str+len_str]
+        # cur_notes[0] = sample num in reference t
+        # cur_notes[1] = always 0
+        # cur_notes[2.1] = 1111 relate to something each?
+        # cur_notes[2.2] = 0, f, or 8
+        # cur_notes[3] = 0xFF or 0x00?
+        # cur_notes[4] = note info?
+        # cur_notes[5] = ?
+        if cur_notes not in unique:
+            unique.append(cur_notes)
+    return unique
 
 def main():
     with open(TEST_FILE, "rb") as f:
@@ -126,45 +139,28 @@ def main():
     # Parse the sample header from 0x0 - 0x568
     samples = get_sample_data(VF)
     num_samples = len(samples)
-    print(f'[+]  Num samples: {num_samples}')
     # parse the seq header from 0x568 - 0x774
     order = get_seq_data(VF)
     num_seq = len(order)
-    print(f'Num seq: {num_seq}; order: {order}')
+    num_sections = max(order) + 1
+    print(f'Num seq: {num_seq}; order: {order}, num_sections: {num_sections}')
     # Now we get into the track information... 0x774 til end
     # calculate the end
     len_tracks = VF.size - 0x774
     print(len_tracks)
-    size_of_section = len_tracks / num_samples
+    # 6 is assumed note info struct length
+    num_notes = len_tracks / 6
+    print(f'{num_notes=}')
     # there are EVENLY divided sections
-    print(size_of_section)
-    return
-    BUFFER_BYTES = (0xFF, 0x0)
-    all_data = []
-    cur_data = b''
-    num_buff = 0
-    thing = {}
-    while True:
-        # read 4 at at ime
-        peaked = VF.peak(4)
-        if peaked == b'':
-            break
-        if all([p in BUFFER_BYTES for p in peaked]):
-            # we hit buffer, read on
-            if len(cur_data) >= 2*num_samples:
-                print(f"[+]  Found seq header at: {hex(VF.pos)}")
-                seq_num = cur_data[0]
-                info_blob = ' '.join([hex(p) for p in cur_data[1:]])
-                if seq_num in thing:
-                    thing[seq_num].append(info_blob)
-                else:
-                    thing.update({cur_data[0]: [info_blob]})
-            cur_data = b''
-            VF.read(4)
-            num_buff += 4
-        else:
-            # we hit some data, report it
-            num_buff = 0
-            cur_data += VF.read(4)
+    size_of_section = num_notes / num_sections
+    print(f'{size_of_section=}')
+    # do some research on all of the bytes n stuff
+    # ret = get_note_info(VF)
+    # a = set()
+    # for r in ret:
+    #     if r[0] == 1:
+    #         a.add(hex(r[2] & ~0x0F))
+    # print(a)
+    # print([hex(a) for a in ret if a[0] == 5])
     # print(json.dumps(thing, indent=4))
 main()
