@@ -16,13 +16,19 @@ HEADER_BYTES = 0x568
 ## 2c x 31 channels (2x16?)
 SEQ_INFO_BYTES = 0x20C  # 0x774-0x568
 SAMPLE_STRUCT_SIZE = 0x2c
-SAMPLE_STRUCT_FORMAT = "<24sIIIII"
+SAMPLE_STRUCT_FORMAT = "<22sHIIIII"
 SAMPLE_STRUCT = struct.Struct(SAMPLE_STRUCT_FORMAT)
 
 NOTE_SCALE = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # 0..127 L..R
 # Panning is fixed for the first 12 channels (music channels)
 PANNING = [ 0, 127, 127, 0, 0, 127, 127, 0, 0, 127, 127, 0, 0, 127, 127, 0 ]
+
+
+def calculate_volume(byte):
+    if byte == 0:
+        return 0
+    return (byte-1)*2
 
 
 def remove_trailing_zeros_from_str(s):
@@ -40,8 +46,15 @@ def calculate_note(notes):
 
 class NoteInfo:
 
-    def __init__(self, bytes):
-        self.sample_num = hex(bytes[0])[2:] if bytes[0] != 0 else '-'  # First 2 bytes refer to the sample number, typically < 31
+    def __init__(self, bytes, samples):
+        self.start_volume = 0
+        self.sample_used = None
+        self.volume = 0
+        self.sample_num = bytes[0]+(bytes[1]*16) if bytes[0] != 0 else '-'  # First 2 bytes refer to the sample number, typically < 31
+        if self.sample_num != '-' and samples[self.sample_num-1] is not None:
+            self.sample_used = samples[self.sample_num-1]
+            self.start_volume = self.sample_used.volume
+
         self.second_byte = bytes[2:4]  # number of notes after C0 * 8 (8 samples per note)
         self.note_played = calculate_note(self.second_byte[0])
         self.retrigger = self.second_byte[1] == 1  # retriggers the same
@@ -49,18 +62,22 @@ class NoteInfo:
         # C0 starts at 12 for MIDI, add 12 to it to make it "midi compliant"
         self.note_played_midi = self.note_played_raw + 12
         self.third_byte = bytes[4:]
-        self.volume = bytes[5] if bytes[4] == 0x0C else '-'
+        if bytes[4] == 12:
+            self.volume = calculate_volume(bytes[5])
+        elif self.sample_num != '-' or self.retrigger:
+            # Then set to the original volume
+            self.volume = self.start_volume
         if bytes[4] == 15:
             print(f'Found this: {bytes[5]}')
     
     def __str__(self):
-        return f"SampleNum: {self.sample_num}, Note: {self.note_played}, ThirdByte: {self.third_byte.hex()}, Retrigger: {self.retrigger}"
+        return f"SampleNum: {self.sample_num}, Note: {self.note_played}, Volume: {self.volume}, TB: {self.third_byte}"
 
 class Sample:
-    def __init__(self, sname, ssize, siden, sloops, sloope, snume):
+    def __init__(self, sname, ssize, volume, sloops, sloope, snume):
         self.sname = sname
         self.ssize = ssize
-        self.siden = siden
+        self.volume = calculate_volume(volume)
         # NDS7 - SOUNDxPNT - Sound Channel X Loopstart Register (W)
         self.sloops = sloops
         self.sloope = sloope
@@ -71,7 +88,7 @@ class Sample:
     def __str__(self):
         s = [f"Sample Name: {self.sname}",
              f"Size: {self.ssize} bytes",
-             f"Start Note: {hex(self.siden)}",
+             f"Volume: {self.volume}",
              f"Loop start: {self.sloops}",
              f"Loop end: {self.sloope}",
              f'Section num: {self.snume}',
@@ -107,14 +124,14 @@ def get_sample_data(vfile):
     for i in range(31):
         # get a section of data
         sample_struct = VF_sample_info.read(SAMPLE_STRUCT_SIZE)
-        sample_name, sample_size, sample_iden, sample_loop_start, sample_loop_end, _ = SAMPLE_STRUCT.unpack(sample_struct)
+        sample_name, idk_yet, sample_size, sample_iden, sample_loop_start, sample_loop_end, _ = SAMPLE_STRUCT.unpack(sample_struct)
         sample_name_decoded = sample_name.decode('utf8')
         if '.pcm' not in sample_name_decoded:
             continue
         # First 24 bytes are the the sample name, which is loaded in from /music/%s
         sample_name = remove_trailing_zeros_from_str(sample_name_decoded)
         s = Sample(sample_name, sample_size, sample_iden, sample_loop_start, sample_loop_end, i+1)
-        samples[i-1] = s
+        samples[i] = s
         # print(s)
     # print(samples)
     return samples
@@ -150,9 +167,9 @@ def display_seq_info(seq_info):
         volume_thing = []
         for i in range(len(x)//4):
             split_thing.append(''.join(['R' if y.retrigger else str(y.sample_num) for y in x[i*4:(i+1)*4]]))
-            # volume_thing.append(''.join([str(y.volume) for y in x[i*4:(i+1)*4]]))
+            volume_thing.append(''.join([str(y.volume) for y in x[i*4:(i+1)*4]]))
         contents.append('|'.join(split_thing))
-        # contents.append('|'.join(volume_thing))
+        contents.append('|'.join(volume_thing))
         print(f"[+]  Section #{xnum}")
         for y in x:
             print(f'  {y}')
@@ -162,34 +179,43 @@ def display_seq_info(seq_info):
         print(f"{hex(cnum)[2:]}| {c}")
     print('')
 
-
 def generate_midi_tracks(seq_info, order, output_filename):
     # Create a new MIDI file for it ! yayy...
-    mf = MIDIFile(len(seq_info[0]))
+    num_channels = len(seq_info[0])
+    mf = MIDIFile(num_channels)
     # TODO: Get the BPM somehow too
     time = 0  # start at beginning
     mf.addTempo(0, time, 120)
     # TODO: Make separate channels for these weird MIDI channels that change samples... really annoying
-    for i in range(len(seq_info[0])):
+    for i in range(num_channels):
         mf.addTrackName(i, time, f"MIDI_Ch_{i}")
     for cur_time, i in enumerate(order):
         for c_num, channel in enumerate(seq_info[i]):
-            mf.addControllerEvent(i, c_num, time, 10, PANNING[c_num])
+            # TODO: These dont work, lol
+            mf.addControllerEvent(c_num, c_num, time, 10, PANNING[c_num])
             # go through each note and add the note info to the sequence!
             for n_index, note in enumerate(channel):
                 if note.note_played == 'None':
+                    # Will set the volume of an already played note if possible
+                    if note.third_byte[0] == 12:
+                        # TODO: This doesnt work?
+                        mf.addControllerEvent(c_num, c_num, time, 7, note.volume)
                     continue
                 pitch = note.note_played_raw
-                duration = 1  # 1 beat long
+                for d_iter, d_note in enumerate(channel[n_index+1:]):
+                    if d_note.retrigger or d_note.sample_used is not None:
+                        # then we hit the next note, set the duration to that
+                        break
+                duration = (d_iter+1)/4
+                # Look forward until either a new note is played or a retrigger is found OR the end of the sequence (64)
                 time = cur_time*16 + (n_index/4)  # when the note strikes... split into quarters
-                volume = 127  # TODO: Figure out the volume stuff in a bit
-                mf.addNote(c_num, c_num, pitch, time, duration, volume)
+                mf.addNote(c_num, c_num, pitch, time, duration, note.volume)
         time += 16
     with open(f"{output_filename}_{c_num}.midi", "wb") as f:
         mf.writeFile(f)
 
 
-def get_note_info(vfile, num_channels):
+def get_note_info(vfile, num_channels, samples):
 
     data_size = vfile.size - SEQ_INFO_BYTES - HEADER_BYTES
     notes_file = VirtualFile(vfile.read(data_size))
@@ -215,7 +241,7 @@ def get_note_info(vfile, num_channels):
                 #     unique_third_bytes.append(hex(note_bytes[3]))
                 # if note_bytes[4:5] not in unique_fourth_bytes:
                 #     unique_fourth_bytes.append(note_bytes[4:5])
-                note_obj = NoteInfo(note_bytes)
+                note_obj = NoteInfo(note_bytes, samples)
                 if seq_info[channel] == None:
                     seq_info[channel] = [note_obj]
                 else:
@@ -240,7 +266,7 @@ def process_mus_file(filename):
     # parse the seq header from 0x568 - 0x774
     num_channels, order, nseqs = get_seq_data(VF)
     # Now we get into the track information... 0x774 til end
-    seq_info = get_note_info(VF, num_channels)
+    seq_info = get_note_info(VF, num_channels, samples)
     generate_midi_tracks(seq_info, order, output_filename)
     # calculate the end
     len_tracks = VF.size - 0x774
@@ -248,7 +274,7 @@ def process_mus_file(filename):
 
 def main():
     data = {}
-    for mfile in glob.glob("data/music/poker.mus"):
+    for mfile in glob.glob("data/music/pokerintro.mus"):
         filename = Path(mfile).name
         print(f"[+]  Processing {filename}")
         tracklen, nsample, seqs, nchannels, nseqs = process_mus_file(mfile)
