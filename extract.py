@@ -23,6 +23,7 @@ NOTE_SCALE = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # 0..127 L..R
 # Panning is fixed for the first 12 channels (music channels)
 PANNING = [ 0, 127, 127, 0, 0, 127, 127, 0, 0, 127, 127, 0, 0, 127, 127, 0 ]
+EMPTY_NOTE = '--'
 
 
 def calculate_volume(byte):
@@ -50,8 +51,8 @@ class NoteInfo:
         self.start_volume = 0
         self.sample_used = None
         self.volume = 0
-        self.sample_num = bytes[0]+(bytes[1]*16) if bytes[0] != 0 else '-'  # First 2 bytes refer to the sample number, typically < 31
-        if self.sample_num != '-' and samples[self.sample_num-1] is not None:
+        self.sample_num = bytes[0]+(bytes[1]*16) if bytes[0] != 0 else EMPTY_NOTE  # First 2 bytes refer to the sample number, typically < 31
+        if self.sample_num != EMPTY_NOTE and samples[self.sample_num-1] is not None:
             self.sample_used = samples[self.sample_num-1]
             self.start_volume = self.sample_used.volume
 
@@ -64,7 +65,7 @@ class NoteInfo:
         self.third_byte = bytes[4:]
         if bytes[4] == 12:
             self.volume = calculate_volume(bytes[5])
-        elif self.sample_num != '-' or self.retrigger:
+        elif self.sample_num != EMPTY_NOTE or self.retrigger:
             # Then set to the original volume
             self.volume = self.start_volume
         if bytes[4] == 15:
@@ -132,8 +133,6 @@ def get_sample_data(vfile):
         sample_name = remove_trailing_zeros_from_str(sample_name_decoded)
         s = Sample(sample_name, sample_size, sample_iden, sample_loop_start, sample_loop_end, i+1)
         samples[i] = s
-        # print(s)
-    # print(samples)
     return samples
 
 
@@ -159,25 +158,37 @@ def get_seq_data(vfile):
 
 
 def display_seq_info(seq_info):
-    header = "#| 0000|1111|2222|3333|4444|5555|6666|7777|8888|9999|AAAA|BBBB|CCCC|DDDD|EEEE|FFFF\n" + "-"*81
+    header = "#| 0 0 0 0 |1 1 1 1 |2 2 2 2 |3 3 3 3 |4 4 4 4 |5 5 5 5 |6 6 6 6 |7 7 7 7 |8 8 8 8 |9 9 9 9 |A A A A |B B B B |C C C C |D D D D |E E E E |F F F F\n" + "-"*146
     contents = []
     for xnum, x in enumerate(seq_info):
         # split into 4s to add the barrier between
         split_thing = []
         volume_thing = []
         for i in range(len(x)//4):
-            split_thing.append(''.join(['R' if y.retrigger else str(y.sample_num) for y in x[i*4:(i+1)*4]]))
-            volume_thing.append(''.join([str(y.volume) for y in x[i*4:(i+1)*4]]))
+            split_thing.append(''.join(['R ' if y.retrigger else str(y.sample_num)+' '*(2-len(str(y.sample_num))) for y in x[i*4:(i+1)*4]]))
+            # volume_thing.append(''.join([str(y.volume) for y in x[i*4:(i+1)*4]]))
         contents.append('|'.join(split_thing))
-        contents.append('|'.join(volume_thing))
-        print(f"[+]  Section #{xnum}")
-        for y in x:
-            print(f'  {y}')
-        print('')
+        # contents.append('|'.join(volume_thing))
+        # print(f"[+]  Section #{xnum}")
+        # for y in x:
+        #     print(f'  {y}')
+        # print('')
     print(header)
     for cnum, c in enumerate(contents):
         print(f"{hex(cnum)[2:]}| {c}")
     print('')
+
+
+def test_me(seq_info):
+    for i in range(len(seq_info)):
+        for c_num, channel in enumerate(seq_info[i]):
+            unique_samples = []
+            for n_index, note in enumerate(channel):
+                if note.sample_used is not None and note.sample_used not in unique_samples:
+                    unique_samples.append(note.sample_used)
+            if len(unique_samples) > 1:
+                print(f"[!]  Seq @: {i}.{c_num+1}; contains multiple samples: {unique_samples}")
+
 
 def generate_midi_tracks(seq_info, order, output_filename):
     # Create a new MIDI file for it ! yayy...
@@ -226,10 +237,6 @@ def get_note_info(vfile, num_channels, samples):
     num_seqs = int(data_size / section_size)
     notes_per_seq = section_size // 6
 
-    # unique_third_bytes = []
-    # unique_fourth_bytes = []
-    # unique_fifth_bytes = []
-
     sequences = []
     for i in range(num_seqs):
         seq_info = [None] * num_channels
@@ -237,10 +244,6 @@ def get_note_info(vfile, num_channels, samples):
         for _ in range(64):
             for channel in range(num_channels):
                 note_bytes = notes_file.read(6)
-                # if hex(note_bytes[3]) not in unique_third_bytes:
-                #     unique_third_bytes.append(hex(note_bytes[3]))
-                # if note_bytes[4:5] not in unique_fourth_bytes:
-                #     unique_fourth_bytes.append(note_bytes[4:5])
                 note_obj = NoteInfo(note_bytes, samples)
                 if seq_info[channel] == None:
                     seq_info[channel] = [note_obj]
@@ -267,21 +270,19 @@ def process_mus_file(filename):
     num_channels, order, nseqs = get_seq_data(VF)
     # Now we get into the track information... 0x774 til end
     seq_info = get_note_info(VF, num_channels, samples)
-    generate_midi_tracks(seq_info, order, output_filename)
+    # generate_midi_tracks(seq_info, order, output_filename)
+    test_me(seq_info)
     # calculate the end
     len_tracks = VF.size - 0x774
     return len_tracks, num_samples, order, num_channels, nseqs
 
 def main():
     data = {}
-    for mfile in glob.glob("data/music/pokerintro.mus"):
+    for mfile in glob.glob("data/music/credits.mus"):
         filename = Path(mfile).name
         print(f"[+]  Processing {filename}")
         tracklen, nsample, seqs, nchannels, nseqs = process_mus_file(mfile)
-        # probably some stereo thing
         section_size = 6 * nchannels * 64
-        # No idea wtf this shit is
-        #  "NumSequencesPlayed": seqs[1]
         data.update({filename: {
             "TrackLen": tracklen,
             "NumSamples": nsample,
